@@ -86,6 +86,9 @@ class Handler(BaseHTTPRequestHandler):
         ("GET", re.compile(r"^/api/workspaces$"), "h_ws_list"),
         ("POST", re.compile(r"^/api/workspaces$"), "h_ws_create"),
         ("GET", re.compile(r"^/api/workspaces/([\w-]+)/state$"), "h_ws_state"),
+        ("GET", re.compile(r"^/api/workspaces/([\w-]+)/epochs$"), "h_epochs"),
+        ("GET", re.compile(
+            r"^/api/workspaces/([\w-]+)/epochs/([\w-]+)/lineage$"), "h_epoch_lineage"),
         ("POST", re.compile(r"^/api/workspaces/([\w-]+)/pages$"), "h_page_open"),
         ("POST", re.compile(r"^/api/workspaces/([\w-]+)/pages/([\w-]+)/heartbeat$"), "h_page_heartbeat"),
         ("POST", re.compile(r"^/api/workspaces/([\w-]+)/pages/([\w-]+)/close$"), "h_page_close"),
@@ -157,6 +160,12 @@ class Handler(BaseHTTPRequestHandler):
     def h_ws_state(self, ws_id, query):
         touch = (query.get("page_id") or [None])[0]
         self._send_json(200, self.store.get_state(ws_id, touch_page_id=touch))
+
+    def h_epochs(self, ws_id, query):
+        self._send_json(200, self.store.list_epochs(ws_id))
+
+    def h_epoch_lineage(self, ws_id, epoch_id, query):
+        self._send_json(200, self.store.get_lineage(ws_id, epoch_id))
 
     def h_page_open(self, ws_id, query):
         self._send_json(201, self.store.open_page(ws_id))

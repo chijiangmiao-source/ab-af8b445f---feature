@@ -153,6 +153,29 @@ def smoke_api(ctx):
     check(s["current_epoch"]["record_count"] == 5, "纪元计数应为 5")
 
 
+@step("API 冒烟：起始纪元列表与无迁移来源谱系")
+def smoke_lineage_origin(ctx):
+    ws = ctx["ws"]
+    _, data = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    check(len(data["epochs"]) == 1, "发布前应只有起始纪元一个已发布纪元")
+    ep = data["epochs"][0]
+    check(ep["number"] == 1 and ep["is_current"] is True, "起始纪元应为当前纪元")
+    check(ep["has_migration_source"] is False, "起始纪元应标示无迁移来源")
+    _, lin = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/{ep['id']}/lineage", expect=200)
+    check(lin["source_epoch"] is None, "起始纪元谱系不应有源纪元")
+    check(lin["lineage_frozen_at"] is None, "起始纪元不应有固化时间")
+    check([e["origin"] for e in lin["entries"]] == ["origin"] * 5,
+          "起始纪元每条记录都应标示为原始记录")
+    check(all(e["source_seq"] is None and e["source_digest"] is None for e in lin["entries"]),
+          "原始记录不应有源序号/源摘要")
+    check(all(e["target_digest"] and "无迁移来源" in e["origin_label"]
+              for e in lin["entries"]), "每条记录应有稳定摘要与无来源说明")
+    # 不存在的纪元 -> 404，且不泄露任何信息
+    code, err = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/ep_nonexistent/lineage")
+    check(code == 404 and err.get("error") == "epoch_lineage_unavailable",
+          f"未知纪元谱系应 404: {code} {err}")
+
+
 # ---------------------------------------------------------------- 场景一
 
 @step("场景一：两页面迁移，旧页迟到保存在发布前后均被拒绝")
@@ -226,6 +249,11 @@ def scenario_interruption_recovery(ctx):
                {"page_id": page_c, "batch_size": 1}, expect=200)
     check(s["migration"]["copied"] == 1 and s["migration"]["phase"] == "copying",
           "应处于部分复制状态")
+    recycled_candidate = s["migration"]["candidate_epoch"]["id"]
+    # 复制中的候选绝不能暴露谱系（部分映射不得外泄）
+    code, err = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/{recycled_candidate}/lineage")
+    check(code == 404 and err.get("error") == "epoch_lineage_unavailable",
+          f"复制中的候选谱系应 404: {code} {err}")
     req(ctx, "POST", f"/api/workspaces/{ws}/pages/{page_c}/close", expect=200)
 
     # 重开页面触发恢复：候选被安全回收，读取仍是完整旧纪元
@@ -234,6 +262,13 @@ def scenario_interruption_recovery(ctx):
     check(s["migration"]["phase"] == "aborted",
           f"复制中断应被安全回收: {s['migration']['phase']}")
     check(s["migration"]["candidate_epoch"] is None, "候选应已回收")
+    # 已回收候选仍不得暴露映射
+    code, err = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/{recycled_candidate}/lineage")
+    check(code == 404 and err.get("error") == "epoch_lineage_unavailable",
+          f"已回收候选谱系应 404: {code} {err}")
+    code, data = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    check(all(e["id"] != recycled_candidate for e in data["epochs"]),
+          "纪元列表不得出现已回收候选")
     check(s["current_epoch"]["number"] == 2, "仍应读到旧纪元 #2")
     check(len(s["records"]) == 6, "记录应完整（无部分复制数据）")
 
@@ -262,6 +297,72 @@ def scenario_interruption_recovery(ctx):
     check(len(s["records"]) == 6, "新纪元记录应完整")
 
 
+# ---------------------------------------------------------------- 谱系
+
+@step("谱系：已发布纪元逐条映射、重复正文分别保留、本纪元新建标示")
+def scenario_lineage(ctx):
+    # 复用场景一的工作区：纪元 #2 = 5 条迁移记录 + 1 条发布后新建
+    ws = ctx["ws"]
+    _, data = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    nums = sorted(e["number"] for e in data["epochs"])
+    check(nums == [1, 2], f"应列出已发布纪元 #1/#2: {nums}")
+    by_num = {e["number"]: e for e in data["epochs"]}
+    check(by_num[2]["is_current"] is True, "#2 应为当前纪元")
+    check(by_num[2]["has_migration_source"] is True
+          and by_num[2]["source_epoch"]["number"] == 1, "#2 应标记迁移自 #1")
+    check(by_num[1]["has_migration_source"] is False, "#1 应无迁移来源")
+    check(by_num[1]["kind"] == "superseded", "#1 应为已被取代状态但仍可查谱系")
+
+    _, lin = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/{by_num[2]['id']}/lineage",
+                 expect=200)
+    check(lin["lineage_count"] == 5 and len(lin["entries"]) == 6,
+          "固化 5 条映射，纪元共 6 条记录")
+    check(lin["source_epoch"]["number"] == 1, "源纪元应为 #1")
+    check(lin["lineage_frozen_at"] is not None, "应有发布事务内的固化时间戳")
+    pairs = [(e["target_seq"], e["source_seq"], e["origin"]) for e in lin["entries"]]
+    check(pairs == [(1, 1, "migrated"), (2, 2, "migrated"), (3, 3, "migrated"),
+                    (4, 4, "migrated"), (5, 5, "migrated"), (6, None, "created")],
+          f"谱系对应关系错误: {pairs}")
+    mig = [e for e in lin["entries"] if e["origin"] == "migrated"]
+    check(all(e["target_digest"] == e["source_digest"] for e in mig),
+          "迁移记录两侧稳定摘要必须一致")
+    check(all("迁移而来" in e["origin_label"] for e in mig), "迁移记录来源说明错误")
+    check("本纪元新建" in lin["entries"][-1]["origin_label"], "新建记录来源说明错误")
+    # 两侧稳定摘要稳定可复算
+    import hashlib
+    expect_d = hashlib.sha256("观测记录-1".encode()).hexdigest()[:12]
+    check(lin["entries"][0]["target_digest"] == expect_d, "稳定摘要算法不符")
+
+    # —— 重复正文：独立工作区内制造正文相同的不同记录 ——
+    _, dup_ws = req(ctx, "POST", "/api/workspaces",
+                    {"name": f"dup-{uuid.uuid4().hex[:8]}"}, expect=201)
+    p = req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/pages", expect=201)[1]["page_id"]
+    for content in ("重复观测", "重复观测", "别的观测"):
+        req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/records",
+            {"page_id": p, "content": content}, expect=201)
+    req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/migration/start",
+        {"page_id": p, "target_version": "v2"}, expect=200)
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/migration/copy",
+                   {"page_id": p, "batch_size": 5}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/migration/validate",
+        {"page_id": p}, expect=200)
+    _, s = req(ctx, "POST", f"/api/workspaces/{dup_ws['id']}/migration/publish",
+               {"page_id": p}, expect=200)
+    _, lin2 = req(ctx, "GET",
+                  f"/api/workspaces/{dup_ws['id']}/epochs/{s['current_epoch']['id']}/lineage",
+                  expect=200)
+    pairs2 = [(e["target_seq"], e["source_seq"], e["origin"]) for e in lin2["entries"]]
+    check(pairs2 == [(1, 1, "migrated"), (2, 2, "migrated"), (3, 3, "migrated")],
+          f"重复正文必须分别成行，按出现顺序配对: {pairs2}")
+    ids = {e["target_record_id"] for e in lin2["entries"]}
+    check(len(ids) == 3, "重复正文的独立记录不得合并")
+    check(lin2["entries"][0]["target_digest"] == lin2["entries"][1]["target_digest"],
+          "同正文摘要应相同，但序号与记录 id 各自独立")
+
+
 # ---------------------------------------------------------------- 场景三
 
 @step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
@@ -271,6 +372,9 @@ def scenario_restart_consistency(ctx):
         return
     ws = ctx["ws"]
     _, before = req(ctx, "GET", f"/api/workspaces/{ws}/state", expect=200)
+    _, lin_before = req(ctx, "GET",
+                        f"/api/workspaces/{ws}/epochs/{before['current_epoch']['id']}/lineage",
+                        expect=200)
 
     code, obj = req(ctx, "POST", "/api/admin/shutdown")
     if code == 403:
@@ -290,6 +394,19 @@ def scenario_restart_consistency(ctx):
     inv_after = {p["id"] for p in after["pages"] if p["state"] == "invalidated"}
     check(inv_before and inv_before <= inv_after, "失效页面状态不一致")
 
+    # 重启后历史已发布纪元及其谱系保持一致
+    _, epochs = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    nums = sorted(e["number"] for e in epochs["epochs"])
+    check(nums == [1, 2, 3], f"重启后历史纪元应完整: {nums}")
+    _, lin_restart = req(ctx, "GET",
+                         f"/api/workspaces/{ws}/epochs/{after['current_epoch']['id']}/lineage",
+                         expect=200)
+    check(lin_restart["lineage_digest"] == lin_before["lineage_digest"],
+          "重启后谱系摘要应一致")
+    check([(e["target_seq"], e["source_seq"], e["origin"]) for e in lin_restart["entries"]]
+          == [(e["target_seq"], e["source_seq"], e["origin"]) for e in lin_before["entries"]],
+          "重启后逐条谱系应一致")
+
 
 # ---------------------------------------------------------------- 主流程
 
@@ -303,7 +420,8 @@ def main():
 
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
-             scenario_stale_write_rejected, scenario_interruption_recovery,
+             smoke_lineage_origin, scenario_stale_write_rejected,
+             scenario_lineage, scenario_interruption_recovery,
              scenario_restart_consistency]
     for s in steps:
         s(ctx)

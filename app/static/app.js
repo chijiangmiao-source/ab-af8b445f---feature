@@ -11,6 +11,7 @@ const PHASE_LABELS = {
 const PAGE_STATE_LABELS = { active: "活动", invalidated: "已失效", closed: "已关闭" };
 
 let wsId = localStorage.getItem("fs_ws_id") || null;
+let selectedEpochId = null;
 let pageId = null;
 let lastState = null;
 
@@ -64,11 +65,126 @@ async function openPage() {
 async function refresh() {
   try {
     const s = await api("GET", `/api/workspaces/${wsId}/state?page_id=${pageId}`);
+    const firstLoad = lastState === null;
+    const currentChanged = !firstLoad &&
+      lastState.current_epoch.id !== s.current_epoch.id;
     lastState = s;
     render(s);
+    await renderEpochPicker(s, currentChanged, firstLoad);
   } catch (e) {
     showBanner(`状态读取失败：${e.message}`, false);
   }
+}
+
+async function renderEpochPicker(s, currentChanged, firstLoad) {
+  let data;
+  try {
+    data = await api("GET", `/api/workspaces/${wsId}/epochs`);
+  } catch (e) {
+    return; // 下次轮询重试，不打断主状态展示
+  }
+  const select = $("epoch-select");
+  const savedId = localStorage.getItem(epochStoreKey());
+  const savedExists = data.epochs.some((e) => e.id === savedId);
+  if (firstLoad) {
+    // 重开页面：记住复核员上次选中的纪元，否则默认当前纪元
+    selectedEpochId = savedExists ? savedId : s.current_epoch.id;
+  } else if (currentChanged) {
+    // 刚发布新纪元：默认切到当前纪元，立刻查看新固化的谱系
+    selectedEpochId = s.current_epoch.id;
+  } else if (!data.epochs.some((e) => e.id === selectedEpochId)) {
+    selectedEpochId = savedExists ? savedId : s.current_epoch.id;
+  }
+  select.innerHTML = "";
+  for (const e of data.epochs) {
+    const opt = document.createElement("option");
+    opt.value = e.id;
+    const tags = [
+      e.is_current ? "当前" : "历史",
+      e.has_migration_source
+        ? `迁移自纪元 #${e.source_epoch.number}`
+        : "起始纪元（无迁移来源）",
+    ];
+    opt.textContent = `纪元 #${e.number} · ${e.version}（${tags.join("，")}）`;
+    select.appendChild(opt);
+  }
+  select.value = selectedEpochId;
+  localStorage.setItem(epochStoreKey(), selectedEpochId);
+  await loadLineage(selectedEpochId);
+}
+
+function epochStoreKey() {
+  return `fs_epoch_id_${wsId}`;
+}
+
+async function loadLineage(epochId) {
+  const tbody = $("lineage");
+  const meta = $("epoch-meta");
+  tbody.innerHTML = "";
+  if (!epochId) {
+    meta.textContent = "";
+    return;
+  }
+  let lin;
+  try {
+    lin = await api("GET", `/api/workspaces/${wsId}/epochs/${epochId}/lineage`);
+  } catch (e) {
+    $("lineage-hint").textContent = `谱系不可用：${e.message}`;
+    meta.textContent = "";
+    return;
+  }
+  const ep = lin.epoch;
+  if (ep.has_migration_source && lin.source_epoch) {
+    $("lineage-hint").textContent =
+      `本纪元由纪元 #${lin.source_epoch.number}（${lin.source_epoch.version}）迁移而来；` +
+      `不可变映射在发布事务中按记录出现顺序固化（${lin.lineage_count} 条，${lin.lineage_frozen_at}），` +
+      "正文相同的独立记录也分别成行。";
+    meta.textContent = `#${ep.number}（${ep.version}） ← #${lin.source_epoch.number}`;
+  } else {
+    $("lineage-hint").textContent =
+      "旧版起始纪元：所有记录均为原始记录，明确标示为无迁移来源。";
+    meta.textContent = `#${ep.number}（${ep.version}） · 起始纪元`;
+  }
+  for (const row of lin.entries) {
+    const tr = document.createElement("tr");
+    tr.className = `og-${row.origin}`;
+    tr.appendChild(digitsCell(row.target_seq));
+    tr.appendChild(digestCell(row.target_digest, row.target_content));
+    tr.appendChild(digitsCell(row.source_seq));
+    tr.appendChild(digestCell(row.source_digest, row.source_content));
+    const td = document.createElement("td");
+    td.textContent = row.origin_label;
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+  if (lin.entries.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "muted";
+    td.textContent = "（该纪元暂无记录）";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+  }
+}
+
+function digitsCell(seq) {
+  const td = document.createElement("td");
+  td.textContent = seq === null || seq === undefined ? "—" : `#${seq}`;
+  return td;
+}
+
+function digestCell(digest, content) {
+  const td = document.createElement("td");
+  if (digest) {
+    td.textContent = digest;
+    td.className = "digest";
+    if (content) td.title = content;
+  } else {
+    td.textContent = "—";
+    td.className = "muted";
+  }
+  return td;
 }
 
 function render(s) {
@@ -185,6 +301,11 @@ async function boot() {
   $("ws-select").onchange = () => {
     localStorage.setItem("fs_ws_id", $("ws-select").value);
     location.reload();
+  };
+  $("epoch-select").onchange = async () => {
+    selectedEpochId = $("epoch-select").value;
+    localStorage.setItem(epochStoreKey(), selectedEpochId);
+    await loadLineage(selectedEpochId);
   };
 
   $("btn-add").onclick = () =>

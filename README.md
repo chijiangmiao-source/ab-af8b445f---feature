@@ -29,9 +29,10 @@ sh scripts/verify.sh
 
 `verify` 服务在编排网络内穿插执行：构建检查（编译/导入/静态资源）→ 单元测试 →
 健康与页面 HTTP 冒烟 → API 冒烟 → 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建
-第二候选）→ 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）→
+第二候选）→ 谱系场景（逐条映射/重复正文分别保留/候选不暴露/重启后一致）→
+场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）→
 场景三（`POST /api/admin/shutdown` 触发进程退出，编排层按 `restart: unless-stopped`
-拉起后，校验本地恢复的纪元/记录/失效状态一致）。跑完自行退出，退出码即结果。
+拉起后，校验本地恢复的纪元/记录/谱系/失效状态一致）。跑完自行退出，退出码即结果。
 
 本地无编排时：`python3 verify.py --no-restart`（跳过重启场景）。
 
@@ -53,6 +54,22 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
   由后来页面或下次启动依据持久化阶段恢复：copying→回收候选；validating→保留
   同一候选待续；publishing→补齐发布。
 
+## 纪元谱系（复核）
+
+发布时，系统在**指针切换的同一持久化提交**中把「源纪元记录 → 目标纪元记录」
+固化为**不可变映射**（`record_lineage` 表，触发器禁止 UPDATE/DELETE）：
+
+- 映射按记录**出现顺序（seq 逐位）**建立，正文相同的独立记录也各自成行，
+  复核员不会把它们误认成同一条；
+- 每行可查：目标序号、源序号、两侧稳定摘要（sha256 前 12 位）及来源说明
+  （「由纪元 #N 迁移而来」/「本纪元新建」/「起始纪元原始记录」）；
+- 仅**已发布或已被取代**且凭据完整（来源纪元、固化时间、条数、摘要齐备）
+  的纪元可返回谱系；候选（复制中/校验中/失败）、已回收纪元一律 404，
+  绝不暴露部分映射；旧版起始纪元明确标示为**无迁移来源**；
+- 发布后在本纪元新建的记录无映射行，谱系中标示为「本纪元新建」；
+- 旧版数据库升级时自动回填：起始纪元标记无来源，历史已发布纪元按现存记录
+  位置重建映射。重开页面或 Compose 重启后，已发布纪元列表与谱系完全一致。
+
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
@@ -60,6 +77,8 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
 | GET | `/healthz` | 健康检查（含 DB） |
 | GET/POST | `/api/workspaces` | 列出 / 建立工作区 |
 | GET | `/api/workspaces/{id}/state` | 当前纪元、迁移阶段、围栏页面及失效状态、当前纪元记录 |
+| GET | `/api/workspaces/{id}/epochs` | 已发布纪元列表（候选/已回收纪元不出现） |
+| GET | `/api/workspaces/{id}/epochs/{eid}/lineage` | 逐条谱系（仅已发布且凭据完整的纪元；起始纪元标示无来源） |
 | POST | `/api/workspaces/{id}/pages` | 打开页面（在当前纪元建立围栏） |
 | POST | `/api/workspaces/{id}/pages/{pid}/heartbeat` | 心跳 |
 | POST/DELETE | `/api/workspaces/{id}/pages/{pid}/close` | 关闭页面 |
@@ -73,7 +92,7 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
 app/db.py        纪元/迁移状态机存储层（SQLite，WAL）
 app/server.py    HTTP API + 静态页
 app/static/      记录页前端
-tests/           单元测试（12 例）
+tests/           单元测试（21 例）
 verify.py        编排内验收服务（退出码报告结果）
 docker-compose.yml / Dockerfile / scripts/verify.sh
 ```
