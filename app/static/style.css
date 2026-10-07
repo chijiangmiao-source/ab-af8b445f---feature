@@ -55,3 +55,9 @@ tr.me { background: #eef4ea; }
 .st-active { color: #2f7a3d; font-weight: 600; }
 .st-invalidated { color: #b3541e; font-weight: 600; }
 .st-closed { color: #8a938a; }
+code {
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 12px; background: #f1f4ee; border-radius: 4px; padding: 1px 5px;
+}
+.lin-ok { color: #2f7a3d; }
+.lin-new { color: #6b7a6c; }

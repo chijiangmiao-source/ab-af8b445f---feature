@@ -13,6 +13,10 @@ const PAGE_STATE_LABELS = { active: "活动", invalidated: "已失效", closed: 
 let wsId = localStorage.getItem("fs_ws_id") || null;
 let pageId = null;
 let lastState = null;
+let publishedEpochs = [];
+let selectedEpochId = localStorage.getItem("fs_epoch_id") || null;
+let lastLineage = null;
+let epochSig = "";
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -66,8 +70,89 @@ async function refresh() {
     const s = await api("GET", `/api/workspaces/${wsId}/state?page_id=${pageId}`);
     lastState = s;
     render(s);
+    await refreshEpochs();
   } catch (e) {
     showBanner(`状态读取失败：${e.message}`, false);
+  }
+}
+
+async function refreshEpochs() {
+  const data = await api("GET", `/api/workspaces/${wsId}/epochs`);
+  const epochs = data.epochs || [];
+  const sig = epochs.map((e) => `${e.id}:${e.record_count}`).join("|");
+  const listChanged = sig !== epochSig;
+  publishedEpochs = epochs;
+
+  const select = $("epoch-select");
+  if (!selectedEpochId || !epochs.some((e) => e.id === selectedEpochId)) {
+    selectedEpochId = lastState.current_epoch.id;
+    localStorage.setItem("fs_epoch_id", selectedEpochId);
+  }
+  if (listChanged) {
+    epochSig = sig;
+    select.innerHTML = "";
+    for (const e of epochs) {
+      const opt = document.createElement("option");
+      opt.value = e.id;
+      const tag = e.id === lastState.current_epoch.id ? "（当前）" : "";
+      opt.textContent = `纪元 #${e.number} · ${e.version}${tag} · ${e.record_count} 条`;
+      select.appendChild(opt);
+    }
+  }
+  select.value = selectedEpochId;
+  // 列表变化（如刚发布/新增记录）或尚未载入时才重拉谱系，避免打断复核操作
+  if (listChanged || !lastLineage) {
+    await loadLineage();
+  }
+}
+
+async function loadLineage() {
+  if (!selectedEpochId) return;
+  try {
+    const lin = await api(
+      "GET", `/api/workspaces/${wsId}/epochs/${selectedEpochId}/lineage`);
+    lastLineage = lin;
+    renderLineage(lin);
+  } catch (e) {
+    lastLineage = null;
+    $("lineage-origin").textContent = `谱系不可用：${e.message}`;
+    $("lineage-rows").innerHTML = "";
+  }
+}
+
+function renderLineage(lin) {
+  const originEl = $("lineage-origin");
+  if (lin.origin) {
+    originEl.textContent =
+      `本纪元由纪元 #${lin.origin.source_number}（${lin.origin.source_version}）` +
+      `迁移而来，固化于 ${lin.origin.migrated_at.slice(0, 19).replace("T", " ")}`;
+  } else {
+    originEl.textContent = "旧版起始纪元：无迁移来源（记录均为本纪元创建）";
+  }
+
+  const tbody = $("lineage-rows");
+  tbody.innerHTML = "";
+  for (const en of lin.entries) {
+    const tr = document.createElement("tr");
+    const same = en.origin === "migrated" && en.target_digest === en.source_digest;
+    const originText = en.origin === "migrated"
+      ? `自源纪元 #${lin.origin.source_number} 位置 #${en.source_seq} 迁移而来`
+      : (lin.origin
+        ? "本纪元创建（迁移后新录入）"
+        : "本纪元创建（起始纪元录入）");
+    tr.innerHTML =
+      `<td>#${en.target_seq}</td>` +
+      `<td><code>${en.target_digest}</code></td>` +
+      `<td>${en.source_seq === null ? "—" : "#" + en.source_seq}</td>` +
+      `<td>${en.source_digest === null ? "—" : `<code>${en.source_digest}</code>`}</td>` +
+      `<td class="${same ? "lin-ok" : "lin-new"}">${originText}${
+        en.origin === "migrated" && !same ? " · 摘要不一致！" : ""}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (lin.entries.length === 0) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td colspan="5" class="muted">（该纪元暂无记录）</td>`;
+    tbody.appendChild(tr);
   }
 }
 
@@ -180,11 +265,19 @@ async function boot() {
       if (!name) return;
       const ws = await api("POST", "/api/workspaces", { name });
       localStorage.setItem("fs_ws_id", ws.id);
+      localStorage.removeItem("fs_epoch_id");
       location.reload();
     });
   $("ws-select").onchange = () => {
     localStorage.setItem("fs_ws_id", $("ws-select").value);
+    localStorage.removeItem("fs_epoch_id");
     location.reload();
+  };
+
+  $("epoch-select").onchange = async () => {
+    selectedEpochId = $("epoch-select").value;
+    localStorage.setItem("fs_epoch_id", selectedEpochId);
+    await loadLineage();
   };
 
   $("btn-add").onclick = () =>

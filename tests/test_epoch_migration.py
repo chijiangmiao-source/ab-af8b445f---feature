@@ -228,6 +228,147 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(states[page_b], "invalidated")
         self.assertEqual(after["migration"]["phase"], "published")
 
+    # ------------------------------------------------------------ 谱系
+
+    def _epoch_id(self, ws_id, number):
+        return self.store.conn.execute(
+            "SELECT id FROM epochs WHERE workspace_id=? AND number=?",
+            (ws_id, number)).fetchone()["id"]
+
+    def test_origin_epoch_marked_without_migration_source(self):
+        """旧版起始纪元：无迁移来源，记录逐条标示为本纪元创建。"""
+        ws, page = self.make_ws(record_count=2)
+        ep1 = self._epoch_id(ws["id"], 1)
+        lin = self.store.get_lineage(ws["id"], ep1)
+        self.assertIsNone(lin["origin"])
+        self.assertEqual([e["origin"] for e in lin["entries"]], ["created", "created"])
+        self.assertTrue(all(e["source_seq"] is None for e in lin["entries"]))
+        self.assertTrue(all(e["target_digest"] for e in lin["entries"]))
+
+    def test_lineage_built_in_order_with_duplicate_content(self):
+        """映射按记录出现顺序逐行固化；正文重复的独立记录分别保留。"""
+        ws = self.store.create_workspace("重复正文样地")
+        page = self.store.open_page(ws["id"])["page_id"]
+        for text in ("降雨", "降雨", "降雨", "物候A"):
+            self.store.add_record(ws["id"], page, text)
+        self.drive_to(ws["id"], page, "published")
+
+        ep2 = self._epoch_id(ws["id"], 2)
+        lin = self.store.get_lineage(ws["id"], ep2)
+        self.assertIsNotNone(lin["origin"])
+        self.assertEqual(lin["origin"]["source_number"], 1)
+        # 四条记录（含三条同文）各自成行，目标/源序号严格按出现位置一一对应
+        self.assertEqual([(e["target_seq"], e["source_seq"], e["origin"])
+                          for e in lin["entries"]],
+                         [(1, 1, "migrated"), (2, 2, "migrated"),
+                          (3, 3, "migrated"), (4, 4, "migrated")])
+        self.assertTrue(all(e["target_digest"] == e["source_digest"]
+                            for e in lin["entries"]))
+        # 持久化表中同样是四行独立映射，没有按正文合并
+        rows = self.store.conn.execute(
+            "SELECT target_seq, source_seq FROM lineage_mappings "
+            "WHERE target_epoch_id=? ORDER BY target_seq", (ep2,)).fetchall()
+        self.assertEqual([(r["target_seq"], r["source_seq"]) for r in rows],
+                         [(1, 1), (2, 2), (3, 3), (4, 4)])
+
+    def test_records_created_after_migration_marked_created(self):
+        """迁移后在新纪元新建的记录：无源位置，标示为本纪元创建。"""
+        ws, page_a = self.make_ws(record_count=2)
+        self.drive_to(ws["id"], page_a, "published")
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page_b, "迁移后新观测")
+        ep2 = self._epoch_id(ws["id"], 2)
+        lin = self.store.get_lineage(ws["id"], ep2)
+        self.assertEqual([(e["target_seq"], e["source_seq"], e["origin"])
+                          for e in lin["entries"]],
+                         [(1, 1, "migrated"), (2, 2, "migrated"),
+                          (3, None, "created")])
+
+    def test_chain_migration_lineage_points_at_immediate_source(self):
+        """连续迁移：第二跳的来源是紧邻的上一个纪元，新建记录映射到其实际位置。"""
+        ws, page_a = self.make_ws(record_count=2)
+        self.drive_to(ws["id"], page_a, "published", version="v2")
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page_b, "新纪元独有")
+        self.drive_to(ws["id"], page_b, "published", version="v3")
+        ep3 = self._epoch_id(ws["id"], 3)
+        lin = self.store.get_lineage(ws["id"], ep3)
+        self.assertEqual(lin["origin"]["source_number"], 2)
+        self.assertEqual([(e["target_seq"], e["source_seq"], e["origin"])
+                          for e in lin["entries"]],
+                         [(1, 1, "migrated"), (2, 2, "migrated"),
+                          (3, 3, "migrated")])
+
+    def test_candidate_and_recycled_epochs_expose_no_lineage(self):
+        """复制中/校验中/失败的候选与回收候选：一律不暴露部分映射。"""
+        ws, page_a = self.make_ws(record_count=3)
+        self.store.start_migration(ws["id"], page_a, "v2")
+        self.store.copy_batch(ws["id"], page_a, 2)
+        cand = self.store.get_state(ws["id"])["migration"]["candidate_epoch"]["id"]
+        # 复制进行中：候选不可读谱系，且映射表里没有任何片段
+        self.assert_api_error(409, "epoch_not_published",
+                              self.store.get_lineage, ws["id"], cand)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM lineage_mappings").fetchone()["c"], 0)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM epoch_origins").fetchone()["c"], 0)
+        # 中断回收：候选纪元消失
+        self.store.close_page(ws["id"], page_a)
+        self.assert_api_error(404, "epoch_not_found",
+                              self.store.get_lineage, ws["id"], cand)
+        self.assertEqual(self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM lineage_mappings").fetchone()["c"], 0)
+
+    def test_failed_candidate_exposes_no_lineage(self):
+        """校验失败的候选仍未发布：谱系不可用；重试成功后映射才固化。"""
+        ws, page_a = self.make_ws(record_count=2)
+        self.drive_to(ws["id"], page_a, "validating")
+        cand = self.store.get_state(ws["id"])["migration"]["candidate_epoch"]["id"]
+        self.store.conn.execute(
+            "UPDATE records SET content='被篡改' WHERE epoch_id=? AND seq=1", (cand,))
+        self.store.validate_migration(ws["id"], page_a)
+        self.assert_api_error(409, "epoch_not_published",
+                              self.store.get_lineage, ws["id"], cand)
+        self.store.start_migration(ws["id"], page_a, "v2")
+        self.drive_to(ws["id"], page_a, "published", start=False)
+        ep2 = self._epoch_id(ws["id"], 2)
+        lin = self.store.get_lineage(ws["id"], ep2)
+        self.assertEqual(len(lin["entries"]), 2)
+        self.assertTrue(all(e["origin"] == "migrated" for e in lin["entries"]))
+
+    def test_only_published_epochs_listed(self):
+        """纪元选择只含已发布纪元，候选从不出现。"""
+        ws, page_a = self.make_ws(record_count=2)
+        self.store.start_migration(ws["id"], page_a, "v2")
+        self.store.copy_batch(ws["id"], page_a, 1)
+        numbers = [e["number"] for e in self.store.list_published_epochs(ws["id"])]
+        self.assertEqual(numbers, [1])
+        self.drive_to(ws["id"], page_a, "published", start=False)
+        epochs = self.store.list_published_epochs(ws["id"])
+        self.assertEqual([(e["number"], e["kind"]) for e in epochs],
+                         [(1, "superseded"), (2, "published")])
+
+    def test_lineage_persists_across_restart(self):
+        """重开存储后历史纪元谱系与来源凭据保持一致。"""
+        ws, page_a = self.make_ws(record_count=3)
+        self.drive_to(ws["id"], page_a, "published")
+        ep2 = self._epoch_id(ws["id"], 2)
+        before = self.store.get_lineage(ws["id"], ep2)
+        self.store.close()
+
+        self.store = Store(self.db_path, page_ttl_seconds=45)
+        after = self.store.get_lineage(ws["id"], ep2)
+        self.assertEqual(after["origin"], before["origin"])
+        self.assertEqual([(e["target_seq"], e["source_seq"], e["origin"],
+                           e["target_digest"], e["source_digest"])
+                          for e in after["entries"]],
+                         [(e["target_seq"], e["source_seq"], e["origin"],
+                           e["target_digest"], e["source_digest"])
+                          for e in before["entries"]])
+        # 历史起始纪元仍明确标示无迁移来源
+        ep1 = self._epoch_id(ws["id"], 1)
+        self.assertIsNone(self.store.get_lineage(ws["id"], ep1)["origin"])
+
 
 if __name__ == "__main__":
     unittest.main()

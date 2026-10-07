@@ -4,7 +4,9 @@
 步骤穿插执行：构建检查 -> 代码测试 -> 健康/页面 HTTP 冒烟 -> API 冒烟 ->
 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建第二候选）->
 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）->
-场景三（发布后进程重启，本地恢复的纪元/记录/失效状态一致）。
+场景三（已发布纪元选择 + 逐行谱系：按出现顺序、重复正文分别保留、
+候选/回收/未发布纪元不暴露映射、起始纪元无迁移来源）->
+场景四（发布后进程重启，本地恢复的纪元/记录/失效/谱系一致）。
 
 用法：
   python verify.py [--base-url http://app:8000] [--no-restart]
@@ -262,15 +264,109 @@ def scenario_interruption_recovery(ctx):
     check(len(s["records"]) == 6, "新纪元记录应完整")
 
 
+# ---------------------------------------------------------------- 谱系场景
+
+def epoch_by_number(ctx, ws, number):
+    _, obj = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    for e in obj["epochs"]:
+        if e["number"] == number:
+            return e
+    raise VerifyError(f"已发布纪元列表中找不到 #{number}: {obj['epochs']}")
+
+
+@step("场景三：谱系按顺序固化、重复正文分别保留、候选不暴露映射")
+def scenario_lineage(ctx):
+    # 独立工作区：三条正文完全相同的独立观测 + 一条独立观测
+    ws_name = f"verify-lineage-{uuid.uuid4().hex[:8]}"
+    ws = req(ctx, "POST", "/api/workspaces", {"name": ws_name}, expect=201)[1]["id"]
+    page = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+    for text in ("同文观测", "同文观测", "同文观测", "独立观测"):
+        req(ctx, "POST", f"/api/workspaces/{ws}/records",
+            {"page_id": page, "content": text}, expect=201)
+
+    # 复制中途：候选不得出现在已发布纪元列表，谱系请求被拒，且无部分映射可窥
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/start",
+        {"page_id": page, "target_version": "v2"}, expect=200)
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+               {"page_id": page, "batch_size": 2}, expect=200)
+    check(s["migration"]["phase"] == "copying", "应处于复制中")
+    cand = s["migration"]["candidate_epoch"]["id"]
+    _, listed = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    check([e["number"] for e in listed["epochs"]] == [1],
+          f"候选纪元不得出现在选择列表: {listed['epochs']}")
+    code, err = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/{cand}/lineage")
+    check(code == 409 and err.get("error") == "epoch_not_published",
+          f"未发布候选不得暴露谱系: {code} {err}")
+
+    # 完成迁移
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page, "batch_size": 3}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/validate",
+        {"page_id": page}, expect=200)
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/publish",
+        {"page_id": page}, expect=200)
+
+    # 发布后：两个纪元均在选择列表；起始纪元明确标示无迁移来源
+    _, listed = req(ctx, "GET", f"/api/workspaces/{ws}/epochs", expect=200)
+    check([(e["number"], e["kind"]) for e in listed["epochs"]] ==
+          [(1, "superseded"), (2, "published")], f"已发布纪元列表异常: {listed['epochs']}")
+    ep1 = epoch_by_number(ctx, ws, 1)
+    _, lin1 = req(ctx, "GET",
+                  f"/api/workspaces/{ws}/epochs/{ep1['id']}/lineage", expect=200)
+    check(lin1["origin"] is None, "旧版起始纪元应明确标示为无迁移来源")
+    check([e["origin"] for e in lin1["entries"]] == ["created"] * 4,
+          "起始纪元记录均应标示为本纪元创建")
+
+    # 新纪元谱系：重复正文的三条记录分别保留，源/目标序号按出现顺序一一对应
+    ep2 = epoch_by_number(ctx, ws, 2)
+    _, lin2 = req(ctx, "GET",
+                  f"/api/workspaces/{ws}/epochs/{ep2['id']}/lineage", expect=200)
+    check(lin2["origin"] is not None and lin2["origin"]["source_number"] == 1,
+          f"新纪元来源凭据应指向纪元 #1: {lin2['origin']}")
+    pairs = [(e["target_seq"], e["source_seq"], e["origin"]) for e in lin2["entries"]]
+    check(pairs == [(1, 1, "migrated"), (2, 2, "migrated"),
+                    (3, 3, "migrated"), (4, 4, "migrated")],
+          f"重复正文也须按出现顺序逐行映射: {pairs}")
+    check(all(e["target_digest"] == e["source_digest"] for e in lin2["entries"]),
+          "两侧稳定摘要应逐行一致")
+
+    # 迁移后在新纪元新建一条：无源位置，标示为本纪元创建
+    page2 = req(ctx, "POST", f"/api/workspaces/{ws}/pages", expect=201)[1]["page_id"]
+    req(ctx, "POST", f"/api/workspaces/{ws}/records",
+        {"page_id": page2, "content": "迁移后新观测"}, expect=201)
+    _, lin2 = req(ctx, "GET",
+                  f"/api/workspaces/{ws}/epochs/{ep2['id']}/lineage", expect=200)
+    last = lin2["entries"][-1]
+    check((last["target_seq"], last["source_seq"], last["origin"]) == (5, None, "created"),
+          f"迁移后新建记录应标示本纪元创建: {last}")
+
+    # 不存在的纪元：404
+    code, err = req(ctx, "GET", f"/api/workspaces/{ws}/epochs/ep_notexist/lineage")
+    check(code == 404 and err.get("error") == "epoch_not_found",
+          f"不存在的纪元应 404: {code} {err}")
+    ctx["lineage_ws"] = ws
+    ctx["lineage_epoch"] = ep2["id"]
+    ctx["lineage_snapshot"] = lin2
+
+
 # ---------------------------------------------------------------- 场景三
 
-@step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
+@step("场景四：发布后进程重启，本地恢复的纪元/记录/失效/谱系一致")
 def scenario_restart_consistency(ctx):
     if ctx["no_restart"]:
         print("[verify] 跳过（--no-restart）")
         return
     ws = ctx["ws"]
     _, before = req(ctx, "GET", f"/api/workspaces/{ws}/state", expect=200)
+    # 谱系快照（当前纪元与起始纪元）一并纳入重启一致性比对
+    cur_ep = epoch_by_number(ctx, ws, before["current_epoch"]["number"])
+    _, lineage_before = req(ctx,
+        f"/api/workspaces/{ws}/epochs/{cur_ep['id']}/lineage", expect=200)
+    lin_ws = ctx.get("lineage_ws")
+    lin_snapshot = ctx.get("lineage_snapshot")
 
     code, obj = req(ctx, "POST", "/api/admin/shutdown")
     if code == 403:
@@ -290,6 +386,25 @@ def scenario_restart_consistency(ctx):
     inv_after = {p["id"] for p in after["pages"] if p["state"] == "invalidated"}
     check(inv_before and inv_before <= inv_after, "失效页面状态不一致")
 
+    # 重启后历史已发布纪元及其谱系保持一致
+    _, lineage_after = req(ctx,
+        f"/api/workspaces/{ws}/epochs/{cur_ep['id']}/lineage", expect=200)
+    check(lineage_after["origin"] == lineage_before["origin"]
+          and [(e["target_seq"], e["source_seq"], e["origin"],
+                e["target_digest"], e["source_digest"]) for e in lineage_after["entries"]]
+          == [(e["target_seq"], e["source_seq"], e["origin"],
+               e["target_digest"], e["source_digest"]) for e in lineage_before["entries"]],
+          "重启后当前纪元谱系不一致")
+    if lin_ws and lin_snapshot:
+        _, lin_restart = req(ctx,
+            f"/api/workspaces/{lin_ws}/epochs/{ctx['lineage_epoch']}/lineage", expect=200)
+        check(lin_restart["origin"] == lin_snapshot["origin"]
+              and [(e["target_seq"], e["source_seq"], e["origin"])
+                   for e in lin_restart["entries"]]
+              == [(e["target_seq"], e["source_seq"], e["origin"])
+                  for e in lin_snapshot["entries"]],
+              "重启后历史纪元谱系（含重复正文映射）不一致")
+
 
 # ---------------------------------------------------------------- 主流程
 
@@ -304,7 +419,7 @@ def main():
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
              scenario_stale_write_rejected, scenario_interruption_recovery,
-             scenario_restart_consistency]
+             scenario_lineage, scenario_restart_consistency]
     for s in steps:
         s(ctx)
 

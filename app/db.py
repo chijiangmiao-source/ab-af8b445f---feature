@@ -9,6 +9,14 @@
   + 失效旧页面一次提交）。发布前后，旧页面的迟到保存一律被拒绝并提示重新载入。
 - 页面在复制/校验/发布之间关闭时，依据持久化阶段恢复：
   复制中 -> 安全回收候选；校验中 -> 保留同一候选等待续用；发布中 -> 立即完成发布。
+
+谱系（lineage）：
+- 候选纪元通过校验并发布时，不可变的「目标记录 -> 源纪元位置」映射与纪元指针切换
+  在同一个持久化事务中固化；映射严格按记录出现顺序逐行建立，正文重复的独立记录
+  也各自成行，绝不按正文合并。
+- 仅已发布（含已被取代的历史已发布纪元）且映射凭据完整的纪元可读取谱系；
+  复制中断/回收/校验失败/未发布候选一律不暴露任何映射片段。
+- 旧版起始纪元明确标示为「无迁移来源」，其记录来源为本纪元录入。
 """
 
 from __future__ import annotations
@@ -73,6 +81,26 @@ CREATE TABLE IF NOT EXISTS pages (
   invalidated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_pages_ws ON pages(workspace_id);
+-- 谱系映射：发布事务中固化的「目标纪元记录 -> 源纪元记录位置」不可变对应。
+-- 严格按记录出现顺序逐行建立（target_seq 即目标位置，source_seq 即源位置），
+-- 正文重复的独立记录各自成行；候选纪元的映射在其发布前绝不存在于此表。
+CREATE TABLE IF NOT EXISTS lineage_mappings (
+  target_epoch_id TEXT NOT NULL,
+  target_seq INTEGER NOT NULL,
+  source_epoch_id TEXT NOT NULL,
+  source_seq INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (target_epoch_id, target_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_source ON lineage_mappings(source_epoch_id);
+-- 纪元级来源凭据：每个由迁移发布的目标纪元恰有一行，证明其迁移来源。
+-- 旧版起始纪元在此表中没有行：据此明确标示为「无迁移来源」。
+-- 与逐行映射同一次发布事务写入；空纪元迁移（0 条记录）也不丢失来源凭据。
+CREATE TABLE IF NOT EXISTS epoch_origins (
+  target_epoch_id TEXT PRIMARY KEY,
+  source_epoch_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -158,6 +186,11 @@ class Store:
             h.update(b"\n")
         return (len(rows), h.hexdigest())
 
+    @staticmethod
+    def _record_digest(content: str) -> str:
+        """单条观测正文的稳定摘要：两侧（源/目标）同文同摘，供复核员逐行比对。"""
+        return hashlib.sha256(content.encode()).hexdigest()[:12]
+
     def _require_driver(self, ws: sqlite3.Row, page: sqlite3.Row | None):
         """迁移操作只能由持有当前纪元围栏的活动页面发起。"""
         if page is None or page["workspace_id"] != ws["id"]:
@@ -194,6 +227,10 @@ class Store:
             # 复制可能只完成了一部分：安全回收候选，绝不展示部分复制的数据
             if cand:
                 self.conn.execute("DELETE FROM records WHERE epoch_id=?", (cand,))
+                self.conn.execute(
+                    "DELETE FROM lineage_mappings WHERE target_epoch_id=?", (cand,))
+                self.conn.execute(
+                    "DELETE FROM epoch_origins WHERE target_epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM epochs WHERE id=?", (cand,))
             self.conn.execute(
                 "UPDATE workspaces SET migration_phase='aborted', "
@@ -375,6 +412,10 @@ class Store:
                 old_cand = ws["migration_candidate_epoch_id"]
                 if old_cand:
                     self.conn.execute("DELETE FROM records WHERE epoch_id=?", (old_cand,))
+                    self.conn.execute(
+                        "DELETE FROM lineage_mappings WHERE target_epoch_id=?", (old_cand,))
+                    self.conn.execute(
+                        "DELETE FROM epoch_origins WHERE target_epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM epochs WHERE id=?", (old_cand,))
                 number = self.conn.execute(
                     "SELECT COALESCE(MAX(number),0)+1 AS n FROM epochs WHERE workspace_id=?",
@@ -493,7 +534,11 @@ class Store:
         return self.get_state(ws_id)
 
     def _publish_locked(self, ws: sqlite3.Row) -> bool:
-        """发布事务体（恢复路径与 publish API 共用）。返回是否成功。"""
+        """发布事务体（恢复路径与 publish API 共用）。返回是否成功。
+
+        指针切换、旧纪元作废、旧页面失效与不可变谱系映射在同一事务提交：
+        事务中断则全部回滚，候选仍是候选，外界永远看不到半成品或部分映射。
+        """
         old = ws["current_epoch_id"]
         cand = ws["migration_candidate_epoch_id"]
         if not cand:
@@ -509,6 +554,23 @@ class Store:
             return False
         self.conn.execute("UPDATE epochs SET kind='superseded' WHERE id=?", (old,))
         self.conn.execute("UPDATE epochs SET kind='published' WHERE id=?", (cand,))
+        # 纪元级来源凭据：即便源纪元没有任何记录，迁移来源也不丢失（区别于起始纪元）
+        self.conn.execute(
+            "INSERT INTO epoch_origins(target_epoch_id, source_epoch_id, created_at) "
+            "VALUES(?,?,?)",
+            (cand, old, now),
+        )
+        # 不可变逐行映射：按目标记录出现顺序（seq）与源同位置记录配对。
+        # 以位置（seq）连接而非正文，因此正文重复的独立记录也分别保留各自一行。
+        self.conn.execute(
+            "INSERT INTO lineage_mappings"
+            "(target_epoch_id, target_seq, source_epoch_id, source_seq, created_at) "
+            "SELECT c.epoch_id, c.seq, s.epoch_id, s.seq, ? "
+            "FROM records c JOIN records s "
+            "  ON s.epoch_id=? AND s.seq=c.seq AND s.content=c.content "
+            "WHERE c.epoch_id=? ORDER BY c.seq",
+            (now, old, cand),
+        )
         # 持有旧纪元围栏的页面全部失效：其后的迟到保存会被拒绝
         self.conn.execute(
             "UPDATE pages SET state='invalidated', invalidated_at=? "
@@ -522,6 +584,106 @@ class Store:
             (cand, now, ws["id"]),
         )
         return True
+
+    def list_published_epochs(self, ws_id: str) -> list[dict]:
+        """工作区全部曾发布的纪元（当前 published + 历史 superseded），按序号排列。
+
+        候选纪元（candidate）绝不出现在列表中：复核员只能选择已固化的纪元。
+        """
+        with self._lock:
+            self._ws(ws_id)
+            rows = self.conn.execute(
+                "SELECT e.id, e.number, e.version, e.kind, e.created_at, "
+                "       (SELECT COUNT(*) FROM records r WHERE r.epoch_id=e.id) AS record_count, "
+                "       EXISTS(SELECT 1 FROM epoch_origins o "
+                "              WHERE o.target_epoch_id=e.id) AS migrated "
+                "FROM epochs e WHERE e.workspace_id=? AND e.kind IN ('published','superseded') "
+                "ORDER BY e.number",
+                (ws_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_lineage(self, ws_id: str, epoch_id: str) -> dict:
+        """返回某已发布纪元的逐行谱系：目标序号、源序号、两侧稳定摘要与来源说明。
+
+        - 仅已发布（含历史已发布）纪元可查；候选/中断/回收纪元一律 409，不暴露片段。
+        - 迁移纪元必须凭据完整（epoch_origins 在且每个映射都能解析到源记录），
+          否则视为凭据不完整而拒绝，绝不返回残缺谱系。
+        - 旧版起始纪元无迁移来源：origin 为 None，每条记录标示为本纪元创建。
+        - 迁移后在目标纪元新建的记录同样逐行保留，标示为「本纪元创建」。
+        """
+        with self._lock:
+            self._maintenance_locked(ws_id)
+            ws = self._ws(ws_id)
+            epoch = self._epoch(epoch_id)
+            if epoch is None or epoch["workspace_id"] != ws_id:
+                raise ApiError(404, "epoch_not_found", "纪元不存在")
+            if epoch["kind"] not in ("published", "superseded"):
+                # 未发布候选 / 已回收：不暴露任何映射片段
+                raise ApiError(409, "epoch_not_published",
+                               "该纪元尚未发布或已回收，谱系不可用")
+            origin_row = self.conn.execute(
+                "SELECT * FROM epoch_origins WHERE target_epoch_id=?", (epoch_id,)
+            ).fetchone()
+            origin = None
+            if origin_row is not None:
+                src = self._epoch(origin_row["source_epoch_id"])
+                if src is None:
+                    raise ApiError(409, "lineage_incomplete",
+                                   "迁移来源凭据不完整，谱系暂不可用")
+                origin = {
+                    "source_epoch_id": src["id"],
+                    "source_number": src["number"],
+                    "source_version": src["version"],
+                    "migrated_at": origin_row["created_at"],
+                }
+            rows = self.conn.execute(
+                "SELECT t.seq AS target_seq, t.content AS target_content, "
+                "       m.source_seq AS source_seq, s.content AS source_content "
+                "FROM records t "
+                "LEFT JOIN lineage_mappings m "
+                "  ON m.target_epoch_id=t.epoch_id AND m.target_seq=t.seq "
+                "LEFT JOIN records s "
+                "  ON s.epoch_id=m.source_epoch_id AND s.seq=m.source_seq "
+                "WHERE t.epoch_id=? ORDER BY t.seq",
+                (epoch_id,),
+            ).fetchall()
+            entries = []
+            for r in rows:
+                migrated = r["source_seq"] is not None
+                if migrated:
+                    if r["source_content"] is None:
+                        # 映射存在却解析不到源位置记录：凭据不完整，拒绝整份谱系
+                        raise ApiError(409, "lineage_incomplete",
+                                       f"目标序号 {r['target_seq']} 的来源位置缺失，谱系暂不可用")
+                    entries.append({
+                        "target_seq": r["target_seq"],
+                        "source_seq": r["source_seq"],
+                        "target_digest": self._record_digest(r["target_content"]),
+                        "source_digest": self._record_digest(r["source_content"]),
+                        "origin": "migrated",
+                    })
+                else:
+                    # 起始纪元的录入，或迁移发布后在本纪元新建的观测
+                    entries.append({
+                        "target_seq": r["target_seq"],
+                        "source_seq": None,
+                        "target_digest": self._record_digest(r["target_content"]),
+                        "source_digest": None,
+                        "origin": "created",
+                    })
+            return {
+                "workspace_id": ws_id,
+                "epoch": {
+                    "id": epoch["id"],
+                    "number": epoch["number"],
+                    "version": epoch["version"],
+                    "kind": epoch["kind"],
+                    "record_count": len(entries),
+                },
+                "origin": origin,
+                "entries": entries,
+            }
 
     # ---------------------------------------------------------------- 状态
 
